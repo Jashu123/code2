@@ -1,0 +1,1129 @@
+#!/usr/bin/env python3
+"""
+Enhanced Test Pool Verifier and Manager
+
+This tool reads over a test pool, validates it, and can modify test arguments based on criteria.
+
+The test pool is specified in the command line arguments.
+"""
+import argparse
+import csv
+import difflib
+import json
+import logging
+import re
+import subprocess
+import shutil
+from collections import OrderedDict
+from datetime import datetime
+from pathlib import Path
+from typing import Callable, Dict, Generator, List, Optional, Tuple
+
+__author__ = "Nicholas Baron"
+__maintainer__ = "Nicholas Baron"
+__version__ = "1.6.0"
+
+TIME_NOW = str(datetime.now())
+
+POOL_CONFIG_JSON_FILE = Path(__file__).resolve().parent / "test_pool_verifier.json"
+try:
+    POOL_CONFIG = json.loads(POOL_CONFIG_JSON_FILE.read_text())
+except (FileNotFoundError, json.JSONDecodeError):
+    POOL_CONFIG = {} if POOL_CONFIG_JSON_FILE.exists() else {}
+
+POOL_FILE_DEFAULT = Path(__file__).resolve().parent / "RedtailDP_MasterTestPool.csv"
+
+VALID_DISABLED_OPTIONS = ["True", ""]
+
+RE_JIRA_ID = r"[A-Z][A-Z0-9_]+-[1-9][0-9]*"
+RE_MTP_NAME = r"([A-Za-z0-9-]+)(\d{4})_(\w+)"
+
+OUTPUT_WIDTH = 75
+
+EXTRA_VAL_KEY = "EXTRA_COLUMN_VAL"
+NO_VAL_KEY = "NO_COLUMN_VAL"
+
+FW_REPO_DEFAULT_DIR_NAME = "platform_fw"
+
+
+class VerifierException(Exception):
+    pass
+
+
+class InvalidTestArgument(VerifierException):
+    pass
+
+
+class InvalidTestPoolEntry(VerifierException):
+    pass
+
+
+class InvalidTestName(VerifierException):
+    pass
+
+
+class InvalidTestNameIndex(InvalidTestName):
+    pass
+
+
+class InvalidColumn(VerifierException):
+    pass
+
+
+class ModificationException(Exception):
+    pass
+
+
+def is_file(path_str):
+    """Test if a string is a valid file path."""
+    path = Path(path_str)
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(
+            "The given path {} is not a file.".format(path_str)
+        )
+    return path
+
+
+def is_dir(path_str):
+    """Test if a string is a valid file path."""
+    path = Path(path_str)
+    if not path.is_dir():
+        raise argparse.ArgumentTypeError(
+            "The given path {} is not a directory.".format(path_str)
+        )
+    return path
+
+
+def index_list_to_str(index_list):
+    """A quick little hack to format a list of ints into a "1-4,6,10" style format.
+
+    Args:
+        index_list (List(int)): A list of ints.
+
+    Returns:
+        str: the string rendition of the list
+    """
+    if not index_list:
+        return ""
+
+    zones = list(set(index_list))
+    zones.sort()
+
+    range_id = 0
+    ranges = [[zones[0], zones[0]]]
+    for zone in list(zones):
+        if ranges[range_id][1] in (zone, zone - 1):
+            ranges[range_id][1] = zone
+        else:
+            ranges.append([zone, zone])
+            range_id += 1
+
+    return ",".join(
+        map(lambda p: "%s-%s" % tuple(p) if p[0] != p[1] else str(p[0]), ranges)
+    )
+
+
+def get_git_branch(path: Path):
+    if not path.is_dir():
+        raise TypeError("Expected path to be a dir. It was not.")
+
+    command = "git rev-parse --abbrev-ref HEAD".split()
+    try:
+        branch_out = subprocess.Popen(command, stdout=subprocess.PIPE, cwd=path).stdout
+        if not branch_out:
+            return "Unknown"
+        return branch_out.read().strip().decode("utf-8")
+    except:
+        return "Unknown"
+
+
+def get_git_sha(path: Path):
+    if not path.is_dir():
+        raise TypeError("Expected path to be a dir. It was not.")
+
+    command = "git rev-list --max-count=1 --skip=# HEAD".split()
+    try:
+        sha_out = subprocess.Popen(command, stdout=subprocess.PIPE, cwd=path).stdout
+        if not sha_out:
+            return "Unknown"
+        return sha_out.read().strip().decode("utf-8")
+    except:
+        return "Unknown"
+
+
+def get_nearest_match(value: str, match_options: List[str]) -> List[str]:
+    suggestions = difflib.get_close_matches(value, match_options, n=1, cutoff=0.1)
+    if len(suggestions) > 0:
+        return [suggestions[0]]
+
+    return []
+
+
+def print_pool_error(pool_file: Path, line_number: int, error_str: str) -> None:
+    print()
+    print(f"ERROR! {pool_file}:{line_number}")
+    print(f" - {error_str}")
+
+
+def type_optional_int(item_str: str) -> Optional[int]:
+    if not item_str:
+        return None
+    return int(item_str, 0)
+
+
+def type_space_seperated_list(item_str: str) -> List[str]:
+    if not isinstance(item_str, str):
+        raise TypeError(
+            f"cannot cast type {item_str.__name__} to a space sepereate list"
+        )
+
+    return item_str.split() if item_str.strip() else []
+
+
+def check_valid_jira(item_str: str) -> str:
+    if re.fullmatch(RE_JIRA_ID, item_str) is None:
+        raise InvalidTestPoolEntry(
+            f"Found Jira Id {item_str} is not valid. Please ensure it is a valid Jira ID."
+        )
+
+    return item_str
+
+
+def check_not_empty(entry_name: str, given_entry) -> str:
+    if not given_entry:
+        raise InvalidTestPoolEntry(f"{entry_name} is blank! It must contain something.")
+
+    return given_entry
+
+
+def check_not_extra_columns(extra_columns: Optional[List]) -> Optional[List]:
+    if extra_columns:
+        raise InvalidColumn(
+            f" There are too many columns in this row. Extra column values: {extra_columns}\n"
+            + "Please check that the columns are aligned, use proper parenthesis where needed."
+        )
+
+    return extra_columns
+
+
+def check_valid_entries(column_name: str, valid_entries: List[str], given_entries):
+    if not POOL_CONFIG:  # Skip validation if config doesn't exist
+        return given_entries
+        
+    invalid_entries = []
+
+    if isinstance(given_entries, list):
+
+        if not given_entries:
+            raise InvalidTestPoolEntry(
+                f"The column {column_name} is empty! We expect at least one of {valid_entries}"
+            )
+
+        for entry in given_entries:
+            if entry not in valid_entries:
+                invalid_entries.append(entry)
+
+    else:
+        if given_entries not in valid_entries:
+            invalid_entries.append(given_entries)
+
+    if invalid_entries:
+        entry_error = [
+            f'Column: "{column_name}" Entries: {invalid_entries} are not valid.',
+            f"Please choose from the list below or reference {POOL_CONFIG_JSON_FILE} if you would like to add an option.",
+            f"{valid_entries}",
+        ]
+
+        all_suggestions: List[str] = []
+
+        for entry in invalid_entries:
+            all_suggestions.extend(get_nearest_match(entry, valid_entries))
+
+        if len(all_suggestions) > 0:
+            entry_error[0] += f" Did you mean? {all_suggestions}"
+
+        raise InvalidTestPoolEntry("\n".join(entry_error))
+
+    return given_entries
+
+
+class FteTest:
+    def __init__(self, **kwargs) -> None:
+        self.disabled: str = kwargs.get("disabled", "")
+        self.notes: str = kwargs.get("notes", "")
+        self.stop_on_fail: str = kwargs.get("stop_on_fail", "")
+        self.name: str = kwargs.get("name", "")
+        self.path: Path = Path(kwargs.get("path", ""))
+        self.base_arguments: List[str] = kwargs.get("base_arguments", [])
+        self.scalable_arguments: List[str] = kwargs.get("scalable_arguments", [])
+        self.environment: str = kwargs.get("environment", "")
+        self.domain: str = kwargs.get("domain", "")
+        self.category: str = kwargs.get("category", "")
+        self.features: List[str] = kwargs.get("features", [])
+        self.labels: List[str] = kwargs.get("labels", [])
+        self.author: str = kwargs.get("author", "")
+        self.build: List[str] = kwargs.get("build", [])
+        self.project: str = kwargs.get("project", "")
+        self.customer: List[str] = kwargs.get("customer", [])
+        self.jira: str = kwargs.get("jira", "")
+        self.req_id: str = kwargs.get("req_id", "")
+        self.feature_id: str = kwargs.get("feature_id", "")
+        self.story_jira: str = kwargs.get("story_jira", "")
+        self.comment: str = kwargs.get("comment", "")
+        self.exclude_density: str = kwargs.get('exclude_density', "")
+        self.alpha: str = kwargs.get("alpha", "")
+        self.pool: str = kwargs.get("pool", "")
+        self.loop_count: str = kwargs.get("loop_count", "")
+        self.redtail_only: str = kwargs.get("redtail_only", "")
+        self.deploy: str = kwargs.get("deploy", "")
+        self.new_script: str = kwargs.get("new_script", "")
+        self.pion: str = kwargs.get("pion", "")
+        self.hw_config: str = kwargs.get("hw_config", "")
+        self.special_hw: str = kwargs.get("special_hw", "")
+        self.dell_enablement_date: str = kwargs.get("dell_enablement_date", "")
+        self.hpe_enablement_date: str = kwargs.get("hpe_enablement_date", "")
+        self.reduction_date: str = kwargs.get("reduction_date", "")
+        self.test_duration: str = kwargs.get("test_duration", "")
+        self.platform: str = kwargs.get("platform", "")
+        self.script_level: str = kwargs.get("script_level", "")
+        self.tag: str = kwargs.get("tag", "")
+
+        self.extra_args: Optional[List[str]] = kwargs.get(EXTRA_VAL_KEY)
+
+        self.category_index: int = int(datetime.utcnow().timestamp())
+        self.short_name: str = ""
+
+    def check_values(self):
+        if not POOL_CONFIG:  # Skip validation if config doesn't exist
+            return
+            
+        check_not_extra_columns(self.extra_args)
+        check_not_empty("Author", self.author)
+        #check_valid_entries("Disabled", VALID_DISABLED_OPTIONS, self.disabled)
+        check_valid_entries(
+            "Environments", POOL_CONFIG.get("environments", []), self.environment
+        )
+        check_valid_entries("Domains", POOL_CONFIG.get("domains", {}).keys(), self.domain)
+        check_valid_entries(
+            "Categories", POOL_CONFIG.get("categories", {}).keys(), self.category
+        )
+        check_valid_entries("Features", POOL_CONFIG.get("features", []), self.features)
+        check_valid_entries("Labels", POOL_CONFIG.get("labels", []), self.labels)
+        check_valid_entries("Build", POOL_CONFIG.get("builds", []), self.build)
+        check_valid_entries("Project", POOL_CONFIG.get("projects", []), self.project)
+        check_valid_entries("Customers", POOL_CONFIG.get("customers", []), self.customer)
+        # check_valid_jira(self.jira)
+
+    def matches_criteria(self, criteria: Dict[str, str]) -> bool:
+        """Check if this test matches the given criteria."""
+        for field, value in criteria.items():
+            test_value = getattr(self, field.lower(), None)
+            if test_value is None:
+                return False
+            
+            # Handle list fields
+            if isinstance(test_value, list):
+                if value not in test_value:
+                    return False
+            else:
+                # Convert to string for comparison
+                if str(test_value).lower() != value.lower():
+                    return False
+        return True
+
+    def add_base_argument(self, arg: str):
+        """Add an argument to base_arguments if it doesn't already exist."""
+        if arg not in self.base_arguments:
+            self.base_arguments.append(arg)
+            return True
+        return False
+
+    def remove_base_argument(self, arg: str):
+        """Remove an argument from base_arguments."""
+        removed = False
+        # Remove exact matches
+        while arg in self.base_arguments:
+            self.base_arguments.remove(arg)
+            removed = True
+        
+        # Also remove arguments that start with the same flag (for key=value style args)
+        if '=' in arg:
+            flag = arg.split('=')[0]
+            to_remove = []
+            for existing_arg in self.base_arguments:
+                if existing_arg.startswith(flag + '='):
+                    to_remove.append(existing_arg)
+            
+            for remove_arg in to_remove:
+                self.base_arguments.remove(remove_arg)
+                removed = True
+        
+        return removed
+
+    def substitute_placeholders(self, arg: str) -> str:
+        """Replace placeholders in arguments with actual test values."""
+        # Replace {test_name} with actual test name
+        arg = arg.replace('{test_name}', self.name)
+        arg = arg.replace('{TestName}', self.name)
+        
+        # Add more substitutions as needed
+        arg = arg.replace('{author}', self.author)
+        arg = arg.replace('{category}', self.category)
+        arg = arg.replace('{pool}', self.pool)
+        
+        return arg
+
+    def add_base_argument(self, arg: str):
+        """Add an argument to base_arguments if it doesn't already exist."""
+        # Replace {TestName} with actual test name
+        arg = arg.replace('{TestName}', self.name)
+        arg = arg.replace('{test_name}', self.name)
+        
+        if arg not in self.base_arguments:
+            self.base_arguments.append(arg)
+            return True
+        return False
+
+    def has_argument(self, arg_flag: str) -> bool:
+        """Check if base_arguments contains the specified argument flag."""
+        for arg in self.base_arguments:
+            # Check for exact match or flag with equals sign
+            if arg == arg_flag or arg.startswith(arg_flag + '='):
+                return True
+        return False
+
+    def get_test_function_name_value(self) -> str:
+        """Extract the value of --test_function_name from base_arguments."""
+        for arg in self.base_arguments:
+            if arg.startswith('--test_function_name='):
+                return arg.split('=', 1)[1]
+        return ""
+
+    def check_iris_compliance(self) -> List[str]:
+        """Check IRIS compliance and return list of issues."""
+        issues = []
+        
+        # Check if --test_function_name is present
+        if not self.has_argument('--test_function_name'):
+            issues.append("Missing --test_function_name argument")
+        else:
+            # Check if the value matches the Test Name
+            function_name_value = self.get_test_function_name_value()
+            if function_name_value != self.name:
+                issues.append(f"--test_function_name='{function_name_value}' does not match Test Name '{self.name}'")
+        
+        return issues
+
+    def check_vssr_compliance(self) -> List[str]:
+        """Check VSSR compliance and return list of issues."""
+        issues = []
+        
+        if self.pool == "Feature":
+            if not self.has_argument('--vssr_enable'):
+                issues.append("Pool=Feature but missing --vssr_enable argument")
+        elif self.pool == "IOStress":
+            if not self.has_argument('--stress_test'):
+                issues.append("Pool=IOStress but missing --stress_test argument")
+        
+        return issues
+
+    def __str__(self):
+        return self.name
+
+
+class CsvParser:
+    def __init__(self, test_pool_path: Path):
+        self.test_pool_path = test_pool_path
+        self.columns_types: OrderedDict[str, Tuple[Callable, str]] = OrderedDict()
+        self.tests: List[FteTest] = []
+
+        self.add_column("Disable", str, "disabled")
+        self.add_column("Notes", str, "notes")
+        self.add_column("Stop On Fail", str, "stop_on_fail")
+        self.add_column("Test Name", str, "name")
+        self.add_column("Test Path", str, "path")
+        self.add_column("Base Args", type_space_seperated_list, "base_arguments")
+        self.add_column("Scalable Arguments", type_space_seperated_list, "scalable_arguments")
+        self.add_column("Environment", str, "environment")
+        self.add_column("Domain", str, "domain")
+        self.add_column("Category", str, "category")
+        self.add_column("Feature", type_space_seperated_list, "features")
+        self.add_column("Labels", type_space_seperated_list, "labels")
+        self.add_column("Author", str, "author")
+        self.add_column("Build", type_space_seperated_list, "build")
+        self.add_column("Project", str, "project")
+        self.add_column("Customer", type_space_seperated_list, "customer")
+        self.add_column("EPIC JIRA", str, "jira")
+        self.add_column("FeatureID", type_optional_int, "feature_id")
+        self.add_column("ReqID", str, "req_id")
+        self.add_column("STORY JIRA", str, "story_jira")
+        self.add_column("Comment", str, "comment")
+        self.add_column("Exclude Density", str, "exclude_density")
+        self.add_column("Alpha", str, "alpha")
+        self.add_column("Pool", str, "pool")
+        self.add_column("LoopCount", str, "loop_count")
+        self.add_column("RedtailOnly", str, "redtail_only")
+        self.add_column("Deploy", str, "deploy")
+        self.add_column("New Script", str, "new_script")
+        self.add_column("PION", str, "pion")
+        self.add_column("HW_Config", str, "hw_config")
+        self.add_column("Special_HW", str, "special_hw")
+        self.add_column("DELL Enablement Date", str, "dell_enablement_date")
+        self.add_column("HPE Enablement Date", str, "hpe_enablement_date")
+        self.add_column("Reduction Date", str, "reduction_date")
+        self.add_column("Test Duration", str, "test_duration")
+        self.add_column("Platform", str, "platform")
+        self.add_column("Script Level", str, "script_level")
+        self.add_column("Tag", str, "tag")
+
+    def add_column(self, column_name: str, column_type: Callable, conversion_name: str):
+        if not isinstance(column_name, str):
+            raise InvalidColumn(f"Column name {column_name} must be a str.")
+
+        self.columns_types[column_name] = (column_type, conversion_name)
+
+    def convert_row(self, csv_row: dict) -> dict:
+        convered_dict = {}
+
+        for key, value in self.columns_types.items():
+            column_type, conversion_name = value
+            raw_value = csv_row.get(key, "")
+            
+            try:
+                convered_dict[conversion_name] = column_type(raw_value)
+            except (ValueError, TypeError) as e:
+                logging.warning(f"Error converting {key}='{raw_value}': {e}")
+                convered_dict[conversion_name] = raw_value if column_type == str else column_type("")
+
+        convered_dict[EXTRA_VAL_KEY] = csv_row.get(EXTRA_VAL_KEY)
+
+        return convered_dict
+
+    def parse_iter(self) -> Generator[Tuple[int, "FteTest"], None, None]:
+        self.tests.clear()
+
+        print(f"Parsing file {self.test_pool_path.name}")
+        with self.test_pool_path.open("r", encoding="utf-8") as test_pool_reader:
+            test_pool_dict_reader = csv.DictReader(
+                test_pool_reader,
+                list(self.columns_types.keys()),
+                restkey=EXTRA_VAL_KEY,
+                restval=NO_VAL_KEY,
+            )
+
+            for line_number, row in enumerate(test_pool_dict_reader, start=1):
+                logging.info(f" - Parsing {line_number} : {row.values()}")
+                if line_number == 1:
+                    continue
+
+                converted_row = self.convert_row(row)
+                test = FteTest(**converted_row)
+                self.tests.append(test)
+                yield line_number, test
+
+    def write_csv(self, output_path: Path = None):
+        """Write the current tests back to a CSV file."""
+        if output_path is None:
+            output_path = self.test_pool_path
+            
+        # Create backup
+        backup_path = output_path.with_suffix(f'.backup_{int(datetime.now().timestamp())}.csv')
+        shutil.copy2(output_path, backup_path)
+        print(f"Created backup: {backup_path}")
+
+        with output_path.open("w", encoding="utf-8", newline="") as csvfile:
+            fieldnames = list(self.columns_types.keys())
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            # Write header
+            writer.writeheader()
+            
+            # Write test data
+            for test in self.tests:
+                row = {}
+                for column_name, (column_type, conversion_name) in self.columns_types.items():
+                    value = getattr(test, conversion_name, "")
+                    
+                    # Convert lists back to space-separated strings
+                    if isinstance(value, list):
+                        row[column_name] = " ".join(str(item) for item in value)
+                    elif value is None:
+                        row[column_name] = ""
+                    else:
+                        row[column_name] = str(value)
+                
+                writer.writerow(row)
+
+    def write_csv(self, output_path: Path):
+        """Write the current tests back to a CSV file."""
+        print(f"Writing modified CSV to {output_path}")
+        
+        # Create backup if overwriting original file
+        if output_path == self.test_pool_path:
+            backup_path = output_path.with_suffix(f'.backup_{int(datetime.now().timestamp())}.csv')
+            shutil.copy2(output_path, backup_path)
+            print(f"Created backup: {backup_path}")
+
+        with output_path.open("w", encoding="utf-8", newline="") as csvfile:
+            fieldnames = list(self.columns_types.keys())
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            # Write header
+            writer.writeheader()
+            
+            # Write test data
+            for test in self.tests:
+                row = {}
+                for column_name, (column_type, conversion_name) in self.columns_types.items():
+                    value = getattr(test, conversion_name, "")
+                    
+                    # Convert lists back to space-separated strings
+                    if isinstance(value, list):
+                        row[column_name] = " ".join(str(item) for item in value)
+                    elif value is None:
+                        row[column_name] = ""
+                    else:
+                        row[column_name] = str(value)
+                
+                writer.writerow(row)
+
+
+class TestPoolModifier:
+    def __init__(self, parser: CsvParser):
+        self.parser = parser
+        self.modifications_made = 0
+
+    def apply_modifications(self, criteria: Dict[str, str], add_args: List[str] = None, remove_args: List[str] = None):
+        """Apply modifications to tests matching the criteria."""
+        print(f"Applying modifications with criteria: {criteria}")
+        
+        if add_args:
+            print(f"Adding arguments: {add_args}")
+        if remove_args:
+            print(f"Removing arguments: {remove_args}")
+
+        matching_tests = 0
+        
+        for test in self.parser.tests:
+            if test.matches_criteria(criteria):
+                matching_tests += 1
+                modified = False
+                
+                # Add arguments
+                if add_args:
+                    for arg in add_args:
+                        # Substitute placeholders
+                        final_arg = test.substitute_placeholders(arg)
+                        if test.add_base_argument(final_arg):
+                            print(f"Added '{final_arg}' to test {test.name}")
+                            modified = True
+                
+                # Remove arguments
+                if remove_args:
+                    for arg in remove_args:
+                        # Substitute placeholders for removal too
+                        final_arg = test.substitute_placeholders(arg)
+                        if test.remove_base_argument(final_arg):
+                            print(f"Removed '{final_arg}' from test {test.name}")
+                            modified = True
+                
+                if modified:
+                    self.modifications_made += 1
+
+        print(f"Found {matching_tests} tests matching criteria")
+        print(f"Modified {self.modifications_made} tests")
+        
+        return self.modifications_made > 0
+
+
+def parse_criteria(criteria_str: str) -> Dict[str, str]:
+    """Parse criteria string like 'pool=Feature,category=IO' into a dictionary."""
+    criteria = {}
+    if not criteria_str:
+        return criteria
+    
+    for criterion in criteria_str.split(','):
+        if '=' not in criterion:
+            raise argparse.ArgumentTypeError(f"Invalid criteria format: {criterion}. Use 'field=value'")
+        
+        field, value = criterion.split('=', 1)
+        criteria[field.strip()] = value.strip()
+    
+    return criteria
+
+
+# Keep existing handler classes for validation mode
+class TestRuleHandler:
+    def __init__(self, args_dict: dict) -> None:
+        pass
+
+    def __call__(self, test: FteTest, test_index: int) -> None:
+        pass
+
+    def __str__(self) -> str:
+        return self.__class__.__name__
+
+    def report(self, parser: "CsvParser"):
+        pass
+
+
+class CheckTestName(TestRuleHandler):
+    def __init__(self, args_dict: dict):
+        self.skip_name_check = args_dict.get("skip_name_check")
+
+        self.test_index_by_cat: Dict[str, List[int]] = {}
+        self.all_test_names: List[str] = []
+
+        self.name_failures: List[Tuple] = []
+
+    def get_name_parts(self, test: FteTest) -> Tuple:
+        re_match = re.fullmatch(RE_MTP_NAME, test.name)
+
+        if not re_match:
+            raise InvalidTestName(
+                f"Invalid Test name {test.name} must match with the regex {RE_MTP_NAME}\n"
+                "Please be sure there are letters followed by 4 numbers, an underscore, followed by a user friendly name."
+            )
+
+        short_category, category_index, short_name = re_match.groups()
+
+        return (short_category, int(category_index), short_name)
+
+    def check_category(self, test: FteTest, short_category):
+        if not POOL_CONFIG or "categories" not in POOL_CONFIG:
+            return
+            
+        if short_category != POOL_CONFIG["categories"].get(test.category):
+            raise InvalidTestName(
+                f"Invalid short form category in {test.name} it should be {POOL_CONFIG['categories'][test.category]}"
+            )
+
+    def check_index(self, test: FteTest, category_index: int):
+        if self.test_index_by_cat.get(test.category) is None:
+            self.test_index_by_cat[test.category] = []
+
+        if category_index not in self.test_index_by_cat[test.category]:
+            self.test_index_by_cat[test.category].append(category_index)
+        else:
+            raise InvalidTestName(f"Invalid test index {category_index}")
+
+    def check_unique_name(self, test: FteTest):
+        raise_error = False
+        if test.name in self.all_test_names:
+            raise_error = True
+
+        self.all_test_names.append(test.name)
+
+        if raise_error:
+            raise InvalidTestName(
+                f"Test name is not unique! {test.name}. Duplicated on line {self.all_test_names.index(test.name)+2}."
+            )
+
+    def get_name_suggestions(self, test: FteTest):
+        if not POOL_CONFIG or "categories" not in POOL_CONFIG:
+            return f"XXXX{1:04d}_{test.path.stem}"
+            
+        short_category = POOL_CONFIG["categories"].get(test.category, "XXXX")
+        user_friendly_name = test.path.stem
+
+        if self.test_index_by_cat.get(test.category) is None:
+            self.test_index_by_cat[test.category] = []
+
+        print(
+            f"Used index for {test.category}: {index_list_to_str(self.test_index_by_cat[test.category])}"
+        )
+        category_index = 1
+        while category_index in self.test_index_by_cat[test.category]:
+            category_index += 1
+
+        self.test_index_by_cat[test.category].append(category_index)
+
+        return f"{short_category}{category_index:04d}_{user_friendly_name}"
+
+    def __call__(self, test: FteTest, test_index: int) -> None:
+        if self.skip_name_check:
+            return
+
+        try:
+            short_category, category_index, short_name = self.get_name_parts(test)
+            self.check_unique_name(test)
+            self.check_category(test, short_category)
+            self.check_index(test, category_index)
+        except InvalidTestName as ex:
+            self.name_failures.append((test, ex, test_index))
+            raise
+
+    def report(self, parser: "CsvParser"):
+
+        if not self.name_failures:
+            return
+
+        for test, failure, test_index in self.name_failures:
+            print_pool_error(parser.test_pool_path, test_index, str(failure))
+            print(f"Suggested Name: {self.get_name_suggestions(test)}")
+
+
+class CheckTestPath(TestRuleHandler):
+    def __init__(self, args_dict: dict) -> None:
+        self.fw_repo_path: Path = args_dict.get("fw_repo_path", Path())
+
+    def __call__(self, test: FteTest, test_index: int) -> None:
+        if self.fw_repo_path is None or not self.fw_repo_path.exists():
+            return
+
+        if test.disabled == "True":
+            return
+
+        try:
+            test_path_in_fw_repo = test.path.relative_to(FW_REPO_DEFAULT_DIR_NAME)
+        except ValueError:
+            raise InvalidTestPoolEntry(
+                f'The test\'s path does not have the expecteds relative fw directory "{FW_REPO_DEFAULT_DIR_NAME}". '
+                'Please be sure the path is in the form: \n"platform_fw/test/fte_platform/fte_common/common_integration'
+                '/test_scripts/blackbox/number_of_writes_and_reads.py"'
+            )
+
+        full_repo_path = self.fw_repo_path / test_path_in_fw_repo
+        if full_repo_path.exists() and full_repo_path.is_file():
+            return
+
+        raise InvalidTestPoolEntry(
+            f'Could not find the test path "{test.path}"\nChecked the full path {full_repo_path}\n'
+            "Please be sure that platform_fw, fte_common are at tip. "
+            "And that test_execution:tip is merged into your branch."
+        )
+
+
+class CheckArgumentPaths(TestRuleHandler):
+
+    PATH_ARGS_TO_CHECK = [
+        "-W",
+        "--test_config",
+        "--runner_config",
+        "--subsystem_config",
+    ]
+
+    def __init__(self, args_dict: dict) -> None:
+        fw_repo_path: Path = args_dict.get("fw_repo_path", Path())
+        self.fte_repo_path: Path = fw_repo_path / "test" / "fte_platform" / "fte_common"
+
+    def check_arg_in_base_arg(self, test, index, argument, base_arg):
+        if argument in base_arg:
+
+            if "=" in base_arg:
+                test_path = base_arg.split("=", maxsplit=1)[1]
+            else:
+                test_path = test.base_arguments[index + 1]
+
+            logging.info(
+                f"Found that test {test.name} has path argument {argument} with path {test_path}"
+            )
+
+            if "fte_common" in test_path:
+                raise InvalidTestArgument(
+                    f"The argument {argument} has been "
+                    "flagged to be a path relative to fte_common. "
+                    "Please check to be sure that the path in this "
+                    'argument does not contain "test/fte_platform/'
+                    f'fte_common"\nBad Path: {test_path}'
+                )
+
+            full_path = self.fte_repo_path / test_path
+            if full_path.exists() and full_path.is_file():
+                return
+
+            raise InvalidTestPoolEntry(
+                f'Could not find the argument {argument} path "{test_path}"\nChecked the full path {full_path}\n'
+                "Please check that the file exists."
+            )
+
+    def __call__(self, test: FteTest, test_index: int) -> None:
+        if not self.fte_repo_path.exists():
+            return
+            
+        if test.disabled == "True":
+            return
+
+        for argument in CheckArgumentPaths.PATH_ARGS_TO_CHECK:
+            for index, base_arg in enumerate(test.base_arguments):
+                self.check_arg_in_base_arg(test, index, argument, base_arg)
+
+
+class VerifyReport:
+    def __init__(self, args_dict: dict) -> None:
+        self.test_passed = 0
+        self.test_failed = 0
+
+        test_pool = args_dict.get("test_pool", Path())
+        self.test_exe_branch = get_git_branch(test_pool.parent) if test_pool.parent.exists() else "Unknown"
+        self.test_exe_sha = get_git_sha(test_pool.parent) if test_pool.parent.exists() else "Unknown"
+
+        fw_repo_path = args_dict.get("fw_repo_path", Path())
+        if fw_repo_path and fw_repo_path.exists():
+            fte_common_path = fw_repo_path / "test" / "fte_platform" / "fte_common"
+            self.fte_common_branch = get_git_branch(fte_common_path) if fte_common_path.exists() else "Unknown"
+            self.fte_common_sha = get_git_sha(fte_common_path) if fte_common_path.exists() else "Unknown"
+        else:
+            self.fte_common_branch = "Unknown"
+            self.fte_common_sha = "Unknown"
+
+        self.file = test_pool
+
+    @property
+    def test_total(self) -> int:
+        return self.test_passed + self.test_failed
+
+    @property
+    def result(self) -> str:
+        if not self.test_total:
+            return "NOT STARTED"
+        return "PASSED" if self.test_failed == 0 else "FAILED"
+
+    def __str__(self):
+
+        # Header
+        ret_str = f"{' Pool Verify Report ':#^{OUTPUT_WIDTH}}\n"
+
+        # File Info
+        ret_str += f"{'Date: ':<8}{TIME_NOW:<{OUTPUT_WIDTH-8}}\n"
+        ret_str += f"{'Test Exe Branch: ':<8}{self.test_exe_branch:<{OUTPUT_WIDTH-8}}\n"
+        ret_str += f"{'Test Exe Sha: ':<8}{str(self.test_exe_sha):<{OUTPUT_WIDTH-8}}\n"
+        ret_str += f"{'ETF Branch: ':<8}{self.fte_common_branch:<{OUTPUT_WIDTH-8}}\n"
+        ret_str += f"{'ETF Sha: ':<8}{str(self.fte_common_sha):<{OUTPUT_WIDTH-8}}\n"
+        ret_str += f"{'File: ':<8}{str(self.file.name):<{OUTPUT_WIDTH-8}}\n"
+
+        # Results
+        passed_str = f"Passed: {self.test_passed}"
+        failed_str = f"Failed: {self.test_failed}"
+        total_str = f"Total: {self.test_total}"
+        ret_str += f"{passed_str:<{OUTPUT_WIDTH//3}}"
+        ret_str += f"{failed_str:^{OUTPUT_WIDTH//3}}"
+        ret_str += f"{total_str:>{OUTPUT_WIDTH//3}}\n"
+
+        # Footer
+        result_str = f" FINAL RESULT: {self.result} "
+        ret_str += f"{result_str:#^{OUTPUT_WIDTH}}"
+        return ret_str
+
+
+def check_and_run_handlers(
+    args_dict: dict, handlers: List[TestRuleHandler], parser: CsvParser
+):
+    report = VerifyReport(args_dict)
+
+    for line_number, test in parser.parse_iter():
+        try:
+            test.check_values()
+
+            for handler in handlers:
+                handler(test, line_number)
+
+            report.test_passed += 1
+        except VerifierException as ex:
+            if not isinstance(ex, InvalidTestName):
+                print_pool_error(
+                    args_dict.get("test_pool", Path()), line_number, str(ex)
+                )
+            report.test_failed += 1
+            if not args_dict.get("continue_on_error") and not isinstance(
+                ex, InvalidTestName
+            ):
+                exit(1)
+
+    return report
+
+
+def report_handlers(handlers: List[TestRuleHandler], parser: CsvParser):
+    for handler in handlers:
+        handler.report(parser)
+
+
+def print_header():
+    header_str = f"{Path(__file__).name} - {__version__} - {TIME_NOW}"
+    print(f"{header_str:^{OUTPUT_WIDTH}}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="A tool to verify and modify fte test pools. Includes IRIS and VSSR compliance checking.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "-p",
+        "--test_pool",
+        type=is_file,
+        default=POOL_FILE_DEFAULT,
+        help="The Path to the test pool to review",
+    )
+    
+    # Mode selection
+    mode_group = parser.add_mutually_exclusive_group(required=False)
+    mode_group.add_argument(
+        "--modify",
+        action="store_true",
+        help="Modify mode: add/remove arguments from tests based on criteria"
+    )
+    mode_group.add_argument(
+        "--validate",
+        action="store_true", 
+        default=True,
+        help="Validation mode (default): validate the test pool"
+    )
+    
+    # Modification arguments
+    modify_group = parser.add_argument_group("modification options")
+    modify_group.add_argument(
+        "--criteria",
+        type=parse_criteria,
+        help="Criteria for selecting tests (e.g., 'pool=Feature,category=IO')"
+    )
+    modify_group.add_argument(
+        "--add-arg",
+        action="append",
+        dest="add_args",
+        help="Argument to add to matching tests (can be used multiple times). Use {test_name} for substitution."
+    )
+    modify_group.add_argument(
+        "--remove-arg", 
+        action="append",
+        dest="remove_args",
+        help="Argument to remove from matching tests (can be used multiple times)"
+    )
+    modify_group.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        help="Output file path (default: overwrite input file)"
+    )
+    
+    # Validation arguments (existing)
+    validation_group = parser.add_argument_group("validation options")
+    validation_group.add_argument(
+        "-fw",
+        "--fw_repo_path",
+        dest="fw_repo_path",
+        type=is_dir,
+        help="The Path to the FW repo for test path checking"
+    )
+    validation_group.add_argument(
+        "-c",
+        "--continue_on_error",
+        dest="continue_on_error",
+        action="store_true",
+        help="Continue testing the pool on error",
+    )
+    validation_group.add_argument(
+        "-n",
+        "--skip_name_check",
+        dest="skip_name_check",
+        action="store_true",
+        help="Skip validation of test names",
+    )
+    
+    # Logging
+    parser.add_argument(
+        "--debug",
+        help="Print lots of debugging statements",
+        action="store_const",
+        dest="loglevel",
+        const=logging.DEBUG,
+        default=logging.WARNING,
+    )
+    parser.add_argument(
+        "--verbose",
+        help="Be verbose",
+        action="store_const",
+        dest="loglevel",
+        const=logging.INFO,
+    )
+    
+    parser.epilog = """
+Examples:
+
+Validation mode (default):
+  python test_pool_manager.py -fw ~/src/platform_fw
+
+Modification mode:
+  # Add --test_function_name=TestName to all tests with Pool=Feature
+  python test_pool_manager.py --modify --criteria "pool=Feature" --add-arg "--test_function_name={test_name}"
+  
+  # Add --vssr_enable to all tests with Pool=Feature  
+  python test_pool_manager.py --modify --criteria "pool=Feature" --add-arg "--vssr_enable"
+  
+  # Add --stress_test to all tests with Pool=IO
+  python test_pool_manager.py --modify --criteria "pool=IO" --add-arg "--stress_test"
+  
+  # Remove --old_flag from all tests with category=Integration
+  python test_pool_manager.py --modify --criteria "category=Integration" --remove-arg "--old_flag"
+  
+  # Multiple criteria and multiple args
+  python test_pool_manager.py --modify --criteria "pool=Feature,category=IO" --add-arg "--flag1" --add-arg "--flag2=value"
+
+Placeholders:
+  {test_name} - replaced with the test name
+  {author} - replaced with the test author
+  {category} - replaced with the test category
+  {pool} - replaced with the test pool
+"""
+    return parser.parse_args()
+
+
+def main():
+    print_header()
+    args = parse_args()
+    args_dict = vars(args)
+
+    logging.basicConfig(level=args.loglevel)
+
+    parser = CsvParser(args_dict.get("test_pool"))
+
+    if args.modify:
+        # Modification mode
+        if not args.criteria:
+            print("ERROR: --criteria is required in modification mode")
+            exit(1)
+        
+        if not args.add_args and not args.remove_args:
+            print("ERROR: At least one of --add-arg or --remove-arg is required in modification mode")
+            exit(1)
+
+        # Load all tests first
+        for line_number, test in parser.parse_iter():
+            pass  # Just load them into parser.tests
+
+        # Apply modifications
+        modifier = TestPoolModifier(parser)
+        changes_made = modifier.apply_modifications(
+            args.criteria,
+            add_args=args.add_args or [],
+            remove_args=args.remove_args or []
+        )
+
+        if changes_made:
+            # Write modified CSV
+            output_path = args.output or parser.test_pool_path
+            parser.write_csv(output_path)
+            print(f"\nSuccessfully modified {modifier.modifications_made} tests")
+        else:
+            print("\nNo modifications were made")
+
+    else:
+        # Validation mode (default)
+        if not args.fw_repo_path:
+            print("WARNING: No fw_repo_path provided, skipping path validation")
+            
+        handlers = [
+            CheckTestName(args_dict),
+            CheckTestPath(args_dict),
+            CheckArgumentPaths(args_dict),
+        ]
+
+        report = check_and_run_handlers(args_dict, handlers, parser)
+        report_handlers(handlers, parser)
+        print(f"\n{report}")
+        if report.test_failed > 0:
+            exit(1)
+
+
+if __name__ == "__main__":
+    main()
