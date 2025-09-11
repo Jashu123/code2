@@ -1,0 +1,146 @@
+# Build Request Bot Configuration
+# Update with your actual credentials and form details
+
+confluence:
+  base_url: "https://yourcompany.atlassian.net/wiki"
+  token: "your_confluence_api_token_here"
+
+ai_extraction:
+  provider: "openai"  # or "claude"
+  api_key: "your_openai_api_key_here"
+  model: "gpt-4"
+  temperature: 0.1  # Low for consistent technical extraction
+
+# Form Templates for Different Build Systems
+form_templates:
+  
+  # Example: Internal Build System
+  internal_build_system:
+    name: "Internal Build Request System"
+    url: "https://your-internal-build-system.com/request"
+    description: "Main internal build and test request system"
+    
+    # Map extracted data fields to form CSS selectors
+    field_mappings:
+      fw_branch: "#firmware_branch_input"
+      fw_sha: "#firmware_sha_input"
+      fte_platform_branch: "#fte_platform_branch_field"
+      fte_platform_sha: "#fte_platform_sha_field"
+      fte_common_branch: "#fte_common_branch_field"
+      fte_common_sha: "#fte_common_sha_field"
+      ff_or_plato: "select[name='platform_type']"  # Dropdown
+      build_type: "select[name='build_type']"      # Dropdown (Debug/Release)
+      tests_comments: "textarea[name='test_requirements']"
+      od_timeouts: "#timeout_hours_input"
+      jira_pr: "#jira_ticket_field"
+      requestor: "#requestor_name_field"
+      fadb_jafs_link: "#fadb_link_field"
+    
+    # Form submission settings
+    submit_selector: ".submit-build-request-btn"
+    wait_after_fill: 2
+    wait_after_submit: 5
+    
+    # Required fields validation
+    required_fields:
+      - "fw_branch"
+      - "fw_sha"
+      - "build_type"
+      - "requestor"
+      - "jira_pr"
+    
+    # Field validation rules
+    validation_rules:
+      fw_sha: "must_be_40_char_hash"
+      fte_platform_sha: "must_be_40_char_hash_or_head"
+      fte_common_sha: "must_be_40_char_hash_or_head"
+      jira_pr: "must_match_jira_pattern"
+  
+  # Example: Jenkins Build Trigger
+  jenkins_build_trigger:
+    name: "Jenkins Build Trigger"
+    url: "https://jenkins.yourcompany.com/job/fw-build/build"
+    description: "Trigger builds via Jenkins web interface"
+    
+    field_mappings:
+      fw_branch: "input[name='FW_BRANCH']"
+      fw_sha: "input[name='FW_SHA']"
+      fte_platform_branch: "input[name='FTE_PLATFORM_BRANCH']"
+      fte_platform_sha: "input[name='FTE_PLATFORM_SHA']"
+      build_type: "select[name='BUILD_TYPE']"
+      tests_comments: "textarea[name='TEST_NOTES']"
+      requestor: "input[name='REQUESTOR']"
+    
+    submit_selector: "#yui-gen1-button"  # Jenkins typical submit button
+    required_fields: ["fw_branch", "build_type"]
+  
+  # Example: External Vendor Portal
+  vendor_test_portal:
+    name: "External Vendor Test Portal"
+    url: "https://vendor-portal.example.com/submit-test-request"
+    description: "Submit test requests to external testing vendor"
+    
+    field_mappings:
+      fw_branch: "#branch_name"
+      fw_sha: "#commit_hash"
+      build_type: "#build_configuration"
+      tests_comments: "#test_requirements_description"
+      od_timeouts: "#max_execution_time"
+      requestor: "#contact_person"
+      jira_pr: "#reference_ticket"
+    
+    submit_selector: "button[type='submit']"
+    wait_after_fill: 3
+    required_fields: ["fw_branch", "fw_sha", "tests_comments", "requestor"]
+
+# Browser automation settings
+browser:
+  headless: true
+  timeout: 15
+  screenshot_on_error: true
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+# Extraction enhancement settings
+extraction:
+  use_regex_fallback: true
+  confidence_threshold: 70  # Minimum confidence score to proceed
+  
+  # Technical patterns for validation
+  patterns:
+    sha_hash: "^[a-f0-9]{40}$"
+    jira_ticket: "^[A-Z]+-\\d+$"
+    branch_name: "^[a-zA-Z0-9/_-]+$"
+  
+  # Common values to recognize
+  known_values:
+    build_types: ["Debug", "Release", "RelWithDebInfo"]
+    platforms: ["FF", "Plato", "Microsoft"]
+    default_branches: ["master", "main", "develop"]
+    default_shas: ["head", "HEAD", "latest"]
+
+# Logging and monitoring
+logging:
+  level: "INFO"
+  file: "build_request_bot.log"
+  include_extraction_details: true
+  screenshot_errors: true
+
+# Retry and error handling
+error_handling:
+  max_retries: 3
+  retry_delay: 5
+  timeout_between_fields: 1
+  timeout_after_submit: 10
+  
+  # What to do on specific errors
+  on_extraction_failure: "notify_and_stop"  # or "use_partial_data"
+  on_form_fill_failure: "screenshot_and_retry"
+  on_submit_failure: "manual_review_required"
+
+# Notification settings (optional)
+notifications:
+  enabled: false
+  slack_webhook: "your_slack_webhook_url"
+  email_recipients: ["build-team@yourcompany.com"]
+  notify_on_success: false
+  notify_on_failure: true
