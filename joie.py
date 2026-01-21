@@ -1,0 +1,77 @@
+def parse_hostlog_text(hostlog_file: Path, traceback_line_limit=15) -> Tuple[str, str]:
+    """
+    Enhanced version that includes both original parsing and PCIe error analysis
+    """
+    logger.info(f"Parsing host log {hostlog_file}")
+    
+    # Original parsing logic
+    last_ten_lines = []
+    last_step = ""
+    traceback_lines = []
+    error = ""
+    traceback_str_index = 0
+    in_traceback = False
+    non_block_failures = []  # ADD THIS LINE
+
+    with hostlog_file.open("r") as reader:
+        for line in reader:
+            line = line.replace("\n", "")
+            if not line.strip():
+                continue
+
+            if "step" in line.lower():
+                last_step = f"LAST STEP: {line}"
+
+            # ADD THESE LINES TO CAPTURE NON-BLOCK FAILURES
+            if "non-block failure" in line.lower() or "non block failure" in line.lower():
+                non_block_failures.append(line)
+
+            last_ten_lines.append(line)
+            last_ten_lines = last_ten_lines[-10:]
+
+            if "Traceback (most recent call last)" in line:
+                in_traceback = True
+                traceback_str_index = line.index("Traceback (most recent call last)")
+                logger.debug("Found traceback start")
+                logger.debug(f"{traceback_str_index=} {in_traceback=} {line[traceback_str_index:]=}")
+                traceback_lines.append(line)
+
+            elif in_traceback:
+                logger.debug(f"{line=}")
+                traceback_lines.append(line)
+
+                if line[traceback_str_index] != " ":
+                    error = line[traceback_str_index:]
+                    logger.info(f"Found error from traceback: {error}")
+                    in_traceback = False
+                    break
+
+    return_str = last_step
+
+    # MODIFY THIS SECTION - Change from this:
+    if not traceback_lines:
+        traceback_lines = last_ten_lines.copy()
+        traceback_lines.append("WARNING: Logs stopped without python traceback printed.")
+
+    # TO THIS:
+    if not traceback_lines:
+        # No traceback found - check for non-block failures
+        if non_block_failures:
+            error = "NON-BLOCK FAILURES DETECTED (No Python Traceback Found)"
+            return_str += "\n\nNON-BLOCK FAILURES:\n"
+            return_str += "=" * 60 + "\n"
+            for failure in non_block_failures[-10:]:  # Show last 10 non-block failures
+                return_str += f"{failure}\n"
+            return_str += "\n" + "=" * 60
+        else:
+            traceback_lines = last_ten_lines.copy()
+            traceback_lines.append("WARNING: Logs stopped without python traceback printed.")
+            
+            for line in traceback_lines[-traceback_line_limit:]:
+                return_str += f"\n{line}"
+    else:
+        # Traceback found - use normal processing
+        for line in traceback_lines[-traceback_line_limit:]:
+            return_str += f"\n{line[traceback_str_index:]}"
+
+    # Rest of the function continues with PCIe analysis...
