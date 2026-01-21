@@ -11,7 +11,7 @@ def parse_hostlog_text(hostlog_file: Path, traceback_line_limit=15) -> Tuple[str
     error = ""
     traceback_str_index = 0
     in_traceback = False
-    non_block_failures = []  # ADD THIS LINE
+    non_block_failures = []  # Track non-block failures
 
     with hostlog_file.open("r") as reader:
         for line in reader:
@@ -22,7 +22,7 @@ def parse_hostlog_text(hostlog_file: Path, traceback_line_limit=15) -> Tuple[str
             if "step" in line.lower():
                 last_step = f"LAST STEP: {line}"
 
-            # ADD THESE LINES TO CAPTURE NON-BLOCK FAILURES
+            # Capture non-block failures
             if "non-block failure" in line.lower() or "non block failure" in line.lower():
                 non_block_failures.append(line)
 
@@ -48,12 +48,6 @@ def parse_hostlog_text(hostlog_file: Path, traceback_line_limit=15) -> Tuple[str
 
     return_str = last_step
 
-    # MODIFY THIS SECTION - Change from this:
-    if not traceback_lines:
-        traceback_lines = last_ten_lines.copy()
-        traceback_lines.append("WARNING: Logs stopped without python traceback printed.")
-
-    # TO THIS:
     if not traceback_lines:
         # No traceback found - check for non-block failures
         if non_block_failures:
@@ -74,4 +68,20 @@ def parse_hostlog_text(hostlog_file: Path, traceback_line_limit=15) -> Tuple[str
         for line in traceback_lines[-traceback_line_limit:]:
             return_str += f"\n{line[traceback_str_index:]}"
 
-    # Rest of the function continues with PCIe analysis...
+    # Add PCIe error analysis
+    try:
+        pcie_summary, pcie_detailed = analyze_pcie_errors_in_hostlog(hostlog_file)
+        
+        # Combine the reports
+        if pcie_summary:
+            error = f"{error}\n{pcie_summary}" if error else pcie_summary
+        
+        if pcie_detailed:
+            return_str = f"{return_str}\n\n{'='*80}\nPCIe ERROR ANALYSIS:\n{pcie_detailed}"
+    except Exception as e:
+        logger.warning(f"PCIe error analysis failed: {e}")
+        # Continue with original functionality if PCIe analysis fails
+
+    logger.info(f"Finished parsing host log {hostlog_file}")
+
+    return error, return_str
